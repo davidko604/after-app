@@ -2,7 +2,7 @@ import { Image } from 'expo-image';
 import { router, useFocusEffect } from 'expo-router';
 import { useSQLiteContext } from 'expo-sqlite';
 import { useCallback, useRef, useState } from 'react';
-import { StyleSheet, Text, View } from 'react-native';
+import { Pressable, StyleSheet, Text, View } from 'react-native';
 
 import {
   ActionButton,
@@ -16,14 +16,26 @@ import {
   StatusPill,
 } from '@/components/app-ui';
 import { palette, radii, spacing } from '@/constants/theme';
-import { usePrototypeState } from '@/features/prototype/prototype-state';
+import {
+  booleanSettingCodec,
+  createDiaryDataLayer,
+  type PendingMealCheckIn,
+  type TimelineEntry,
+  type TimelineSummary,
+} from '@/db';
+import { SAMPLE_DATA_ENABLED_SETTING } from '@/features/patterns/sample-dataset';
+import { sampleMealImageSource } from '@/features/patterns/sample-images';
 
-type CountRow = { count: number };
-type DiarySummary = { meals: number; symptoms: number };
 type DiarySummaryState =
   | { status: 'error' }
   | { status: 'loading' }
-  | { status: 'ready'; summary: DiarySummary };
+  | {
+      entries: readonly TimelineEntry[];
+      isSampleData: boolean;
+      pending: readonly PendingMealCheckIn[];
+      status: 'ready';
+      summary: TimelineSummary;
+    };
 
 const todayLabel = new Intl.DateTimeFormat(undefined, {
   day: 'numeric',
@@ -33,7 +45,6 @@ const todayLabel = new Intl.DateTimeFormat(undefined, {
 
 export default function TimelineScreen() {
   const db = useSQLiteContext();
-  const { meal, symptom } = usePrototypeState();
   const requestId = useRef(0);
   const [summaryState, setSummaryState] = useState<DiarySummaryState>({ status: 'loading' });
 
@@ -42,18 +53,21 @@ export default function TimelineScreen() {
     setSummaryState({ status: 'loading' });
 
     try {
-      const [mealRow, symptomRow] = await Promise.all([
-        db.getFirstAsync<CountRow>("SELECT COUNT(*) AS count FROM meals WHERE source = 'real'"),
-        db.getFirstAsync<CountRow>(
-          "SELECT COUNT(*) AS count FROM symptom_events WHERE source = 'real'",
-        ),
+      const diary = createDiaryDataLayer(db);
+      const sampleSetting = await diary.settings.get(
+        SAMPLE_DATA_ENABLED_SETTING,
+        booleanSettingCodec,
+      );
+      const isSampleData = sampleSetting?.value ?? false;
+      const timeline = isSampleData ? diary.sample.timeline : diary.real.timeline;
+      const [entries, pending, summary] = await Promise.all([
+        timeline.list({ limit: 100 }),
+        isSampleData ? Promise.resolve([]) : timeline.listPendingMealCheckIns({ limit: 10 }),
+        timeline.getSummary(),
       ]);
 
       if (activeRequest === requestId.current) {
-        setSummaryState({
-          status: 'ready',
-          summary: { meals: mealRow?.count ?? 0, symptoms: symptomRow?.count ?? 0 },
-        });
+        setSummaryState({ entries, isSampleData, pending, status: 'ready', summary });
       }
     } catch {
       if (activeRequest === requestId.current) {
@@ -72,11 +86,9 @@ export default function TimelineScreen() {
     }, [loadSummary]),
   );
 
-  const prototypeCount = (meal ? 1 : 0) + (symptom ? 1 : 0);
   const summary = summaryState.status === 'ready' ? summaryState.summary : null;
-  const realCount = summary ? summary.meals + summary.symptoms : 0;
-  const entryCount = realCount + prototypeCount;
-  const isEmpty = summaryState.status === 'ready' && entryCount === 0;
+  const entryCount = summary?.total ?? 0;
+  const isEmpty = summaryState.status === 'ready' && summaryState.entries.length === 0;
   const entryLabel = `${entryCount} ${entryCount === 1 ? 'entry' : 'entries'}`;
 
   return (
@@ -88,12 +100,34 @@ export default function TimelineScreen() {
             <View style={styles.brandBowl} />
           </View>
           <Text accessibilityRole="header" style={styles.brandName}>After</Text>
-          <StatusPill tone="peach">Current-session demo</StatusPill>
+          <StatusPill tone={summaryState.status === 'ready' && summaryState.isSampleData ? 'peach' : 'sage'}>
+            {summaryState.status === 'ready' && summaryState.isSampleData
+              ? 'Sample history'
+              : 'Private on device'}
+          </StatusPill>
         </View>
         <Eyebrow>{todayLabel}</Eyebrow>
         <Heading>Notice what happens after.</Heading>
         <Body>Log a meal now. Check in later. Build a clearer picture from your observations.</Body>
       </View>
+
+      {summaryState.status === 'ready' && summaryState.isSampleData ? (
+        <View testID="timeline-sample-banner">
+          <Card style={styles.sampleBanner}>
+            <Text style={styles.entryTitle}>Synthetic sample history</Text>
+            <Body style={styles.pendingBody}>
+              These meals and check-ins are fictional demo records. Your private diary is hidden,
+              not changed, while sample mode is on.
+            </Body>
+            <ActionButton
+              label="Manage sample history"
+              onPress={() => router.push('/settings')}
+              testID="timeline-manage-sample"
+              variant="secondary"
+            />
+          </Card>
+        </View>
+      ) : null}
 
       <View style={styles.actions}>
         <ActionButton
@@ -103,8 +137,9 @@ export default function TimelineScreen() {
           testID="timeline-log-meal"
         />
         <ActionButton
-          accessibilityHint="Opens a quick symptom check-in without selecting a meal"
-          label="Log symptoms"
+          accessibilityHint="Opens a quick bowel-movement check-in without selecting a meal"
+          accessibilityLabel="Log a bowel movement"
+          label="Log a poop"
           onPress={() => router.push({ pathname: '/check-in/[mealId]', params: { mealId: 'unlinked' } })}
           testID="timeline-log-symptom"
           variant="secondary"
@@ -152,7 +187,7 @@ export default function TimelineScreen() {
       ) : isEmpty ? (
         <View testID="timeline-empty">
           <EmptyState
-            body="Your first demo meal or symptom entry will appear here for this app session. Entries created in this preview are not yet saved across restarts."
+            body="Your first meal or symptom entry will appear here and stay in the private diary on this device."
             icon={<View style={styles.emptyIcon}><View style={styles.emptyIconLine} /></View>}
             title="A quiet timeline is a good place to start"
           />
@@ -160,60 +195,97 @@ export default function TimelineScreen() {
       ) : (
         <View testID="timeline-ready">
           <Card>
-            {symptom ? (
-              <View style={styles.timelineItem} testID="timeline-symptom-entry">
-                <View style={[styles.timelineIcon, styles.symptomIcon]}><Text style={styles.timelineGlyph}>◌</Text></View>
-                <View style={styles.timelineCopy}>
-                  <Text style={styles.entryTitle}>Symptom check-in</Text>
-                  <Text style={styles.entryMetadata}>
-                    Just now · Stool {symptom.stoolConsistency} · {symptom.urgency} urgency ·
-                    cramping {symptom.cramping} · bloating {symptom.bloating}
-                  </Text>
-                  {meal ? <Text style={styles.association}>Meal: {meal.name}</Text> : null}
-                </View>
-              </View>
-            ) : null}
-            {meal ? (
-              <View style={styles.timelineItem} testID="timeline-meal-entry">
-                {meal.photoUri ? (
-                  <Image accessibilityLabel="Meal thumbnail" contentFit="cover" source={meal.photoUri} style={styles.mealImage} />
-                ) : (
-                  <View style={styles.timelineIcon}><Text style={styles.timelineGlyph}>●</Text></View>
-                )}
-                <View style={styles.timelineCopy}>
-                  <Text style={styles.entryTitle}>{meal.name}</Text>
-                  <Text style={styles.entryMetadata}>A moment ago · Current session</Text>
-                  <View style={styles.tags}>
-                    {meal.factors.map((factor) => <Text key={factor} style={styles.tag}>{factor}</Text>)}
+            {summaryState.entries.map((entry) =>
+              entry.kind === 'meal' ? (
+                <Pressable
+                  accessibilityHint="Opens this saved meal"
+                  accessibilityLabel={`${entry.meal.name}, ${formatEntryTime(entry.occurredAt)}`}
+                  accessibilityRole="button"
+                  key={`meal-${entry.id}`}
+                  onPress={() =>
+                    router.push({
+                      pathname: '/meal/[mealId]',
+                      params: {
+                        mealId: String(entry.id),
+                        source: summaryState.isSampleData ? 'sample' : 'real',
+                      },
+                    })
+                  }
+                  style={({ pressed }) => [styles.timelineItem, pressed && styles.entryPressed]}
+                  testID={`timeline-meal-${entry.id}`}>
+                  {entry.meal.imageUri ? (
+                    <Image
+                      accessibilityLabel="Meal thumbnail"
+                      contentFit="cover"
+                      source={sampleMealImageSource(entry.meal.imageUri)}
+                      style={styles.mealImage}
+                    />
+                  ) : (
+                    <View style={styles.timelineIcon}>
+                      <Text style={styles.timelineGlyph}>●</Text>
+                    </View>
+                  )}
+                  <View style={styles.timelineCopy}>
+                    <Text style={styles.entryTitle}>{entry.meal.name}</Text>
+                    <Text style={styles.entryMetadata}>{formatEntryTime(entry.occurredAt)}</Text>
+                    <View style={styles.tags}>
+                      {entry.meal.factors.map(({ factor }) => (
+                        <Text key={factor.id} style={styles.tag}>{factor.label}</Text>
+                      ))}
+                    </View>
+                  </View>
+                </Pressable>
+              ) : (
+                <View
+                  key={`symptom-${entry.id}`}
+                  style={styles.timelineItem}
+                  testID={`timeline-symptom-${entry.id}`}>
+                  <View style={[styles.timelineIcon, styles.symptomIcon]}>
+                    <Text style={styles.timelineGlyph}>◌</Text>
+                  </View>
+                  <View style={styles.timelineCopy}>
+                    <Text style={styles.entryTitle}>Bathroom check-in</Text>
+                    <Text style={styles.entryMetadata}>
+                      {formatEntryTime(entry.occurredAt)} · Stool {entry.symptom.stoolConsistency} ·{' '}
+                      {entry.symptom.urgency} urgency · cramping {entry.symptom.cramping} · bloating{' '}
+                      {entry.symptom.bloating}
+                    </Text>
+                    {entry.symptom.meal ? (
+                      <Text style={styles.association}>Meal: {entry.symptom.meal.name}</Text>
+                    ) : null}
                   </View>
                 </View>
-              </View>
-            ) : null}
-            {realCount > 0 ? (
-              <Body style={styles.realSummary}>
-                This device also has {summary?.meals ?? 0} persisted meal records and{' '}
-                {summary?.symptoms ?? 0} persisted symptom records. This preview can count those
-                records, but does not list their details yet.
-              </Body>
-            ) : null}
+              ),
+            )}
           </Card>
         </View>
       )}
 
-      <View style={styles.sectionHeader}>
-        <SectionTitle>Pending check-ins</SectionTitle>
-        <StatusPill tone="peach">{meal && !symptom ? 'Ready now' : 'None ready'}</StatusPill>
-      </View>
-      {meal && !symptom ? (
+      {summaryState.status !== 'ready' || !summaryState.isSampleData ? (
+        <>
+          <View style={styles.sectionHeader}>
+            <SectionTitle>Pending check-ins</SectionTitle>
+        <StatusPill tone="peach">
+          {summaryState.status === 'ready' && summaryState.pending.length > 0
+            ? `${summaryState.pending.length} ready`
+            : 'None ready'}
+        </StatusPill>
+          </View>
+          {summaryState.status === 'ready' && summaryState.pending.length > 0 ? (
         <Card style={styles.pendingCard}>
-          <Text style={styles.entryTitle}>Check in after {meal.name}</Text>
+          <Text style={styles.entryTitle}>Check in after {summaryState.pending[0].meal.name}</Text>
           <Body style={styles.pendingBody}>
-            Reminders are not scheduled in this build, so this card keeps the manual check-in
-            available.
+            This meal&apos;s check-in window has arrived. You can record it now even if notifications
+            are unavailable.
           </Body>
           <ActionButton
             label="Check in now"
-            onPress={() => router.push({ pathname: '/check-in/[mealId]', params: { mealId: 'prototype-meal' } })}
+            onPress={() =>
+              router.push({
+                pathname: '/check-in/[mealId]',
+                params: { mealId: String(summaryState.pending[0].meal.id) },
+              })
+            }
             testID="timeline-pending-check-in"
             variant="secondary"
           />
@@ -221,14 +293,15 @@ export default function TimelineScreen() {
       ) : (
         <Card style={styles.pendingCard}>
           <Body>
-            {symptom
-              ? 'Your latest meal check-in is complete. Repeated observations will make comparisons more useful.'
-              : 'Reminders are not scheduled in this build. After you log a demo meal, its manual check-in will appear here.'}
+            Saved meals appear here when their check-in window arrives. You can always use “Log
+            symptoms” for an unlinked observation.
           </Body>
         </Card>
-      )}
+          )}
+        </>
+      ) : null}
 
-      {symptom ? (
+      {summaryState.status === 'ready' && summaryState.summary.symptoms > 0 ? (
         <ActionButton
           label="See how patterns will look"
           onPress={() => router.push('/patterns')}
@@ -253,6 +326,7 @@ const styles = StyleSheet.create({
   emptyIcon: { alignItems: 'center', backgroundColor: palette.sage, borderRadius: radii.pill, height: 64, justifyContent: 'center', width: 64 },
   emptyIconLine: { borderBottomLeftRadius: 20, borderBottomRightRadius: 20, borderColor: palette.forest, borderTopWidth: 0, borderWidth: 3, height: 15, width: 34 },
   entryMetadata: { color: palette.muted, fontSize: 12, lineHeight: 18, marginTop: 3, textTransform: 'capitalize' },
+  entryPressed: { opacity: 0.72 },
   entryTitle: { color: palette.ink, fontSize: 17, fontWeight: '800' },
   errorCard: { borderColor: palette.danger },
   errorTitle: { color: palette.danger, fontSize: 18, fontWeight: '800', marginBottom: spacing.sm },
@@ -262,8 +336,8 @@ const styles = StyleSheet.create({
   mealImage: { borderRadius: radii.md, height: 54, width: 54 },
   pendingBody: { marginBottom: spacing.md, marginTop: spacing.sm },
   pendingCard: { backgroundColor: palette.peachSoft },
-  realSummary: { borderTopColor: palette.border, borderTopWidth: StyleSheet.hairlineWidth, marginTop: spacing.md, paddingTop: spacing.md },
   retryAction: { marginTop: spacing.md },
+  sampleBanner: { backgroundColor: palette.peachSoft, borderColor: palette.peach },
   sectionHeader: { alignItems: 'center', flexDirection: 'row', justifyContent: 'space-between' },
   symptomIcon: { backgroundColor: palette.peachSoft },
   tag: { backgroundColor: palette.sage, borderRadius: radii.pill, color: palette.forestPressed, fontSize: 10, fontWeight: '800', overflow: 'hidden', paddingHorizontal: 8, paddingVertical: 5 },
@@ -273,3 +347,16 @@ const styles = StyleSheet.create({
   timelineIcon: { alignItems: 'center', backgroundColor: palette.sage, borderRadius: radii.md, height: 54, justifyContent: 'center', width: 54 },
   timelineItem: { alignItems: 'flex-start', borderBottomColor: palette.border, borderBottomWidth: StyleSheet.hairlineWidth, flexDirection: 'row', gap: spacing.md, paddingVertical: spacing.md },
 });
+
+function formatEntryTime(occurredAt: string): string {
+  const date = new Date(occurredAt);
+  const today = new Date();
+  const sameDay = date.toDateString() === today.toDateString();
+
+  return new Intl.DateTimeFormat(undefined, {
+    day: sameDay ? undefined : 'numeric',
+    hour: 'numeric',
+    minute: '2-digit',
+    month: sameDay ? undefined : 'short',
+  }).format(date);
+}

@@ -22,7 +22,9 @@ export type MealAnalysisRequest = {
 };
 
 export type MealAnalysisResult = {
+  contractVersion: 2;
   factors: MealFactorKey[];
+  mealName: string | null;
   model: 'deterministic-fixture' | 'gpt-5.6-luna';
   notice: string;
   source: MealAnalysisSource;
@@ -80,10 +82,16 @@ export function parseMealAnalysisResult(value: unknown): MealAnalysisResult | nu
     return null;
   }
 
-  const { factors, model, notice, source } = value;
+  const { contractVersion, factors, mealName, model, notice, source } = value;
   if (
+    contractVersion !== 2 ||
     !Array.isArray(factors) ||
     !factors.every(isMealFactorKey) ||
+    (mealName !== undefined &&
+      mealName !== null &&
+      (typeof mealName !== 'string' ||
+        mealName.trim().length === 0 ||
+        mealName.trim().length > 80)) ||
     typeof notice !== 'string' ||
     (source !== 'fixture' && source !== 'openai') ||
     (model !== 'deterministic-fixture' && model !== 'gpt-5.6-luna')
@@ -91,7 +99,14 @@ export function parseMealAnalysisResult(value: unknown): MealAnalysisResult | nu
     return null;
   }
 
-  return { factors: [...new Set(factors)], model, notice, source };
+  return {
+    contractVersion,
+    factors: [...new Set(factors)],
+    mealName: typeof mealName === 'string' ? mealName.trim() : null,
+    model,
+    notice,
+    source,
+  };
 }
 
 export function parseMealAnalysisError(value: unknown): MealAnalysisErrorResponse | null {

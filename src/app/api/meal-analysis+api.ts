@@ -11,7 +11,7 @@ import {
 const OPENAI_MODEL = 'gpt-5.6-luna' as const;
 const OPENAI_TIMEOUT_MS = 18_000;
 
-const FACTOR_SCHEMA = {
+const ANALYSIS_SCHEMA = {
   additionalProperties: false,
   properties: {
     factors: {
@@ -21,16 +21,20 @@ const FACTOR_SCHEMA = {
       },
       type: 'array',
     },
+    mealName: {
+      type: 'string',
+    },
     notice: {
       type: 'string',
     },
   },
-  required: ['factors', 'notice'],
+  required: ['factors', 'mealName', 'notice'],
   type: 'object',
 } as const;
 
 type OpenAIAnalysisPayload = {
   factors: MealFactorKey[];
+  mealName: string;
   notice: string;
 };
 
@@ -79,7 +83,7 @@ export async function POST(request: Request) {
         input: [
           {
             content:
-              'Identify only possible meal factors from the allowed list. Treat every result as a hypothesis. Never infer hidden ingredients, safety, causality, a diagnosis, or dietary advice.',
+              'Suggest a short editable meal name and identify only possible meal factors from the allowed list. Base both only on visible food and drink. Treat every factor as a hypothesis. Never infer hidden ingredients, safety, causality, a diagnosis, or dietary advice.',
             role: 'system',
           },
           {
@@ -90,7 +94,7 @@ export async function POST(request: Request) {
                 type: 'input_image',
               },
               {
-                text: `Allowed factors: ${MEAL_FACTOR_OPTIONS.map((option) => `${option.key} (${option.label})`).join(', ')}. Return only visible, plausible hypotheses. The notice must remind the user that hidden ingredients cannot be identified from a photo.`,
+                text: `Suggest a concise 2–6 word meal name based on what is visibly present. Use a generic description when the exact dish is uncertain. Allowed factors: ${MEAL_FACTOR_OPTIONS.map((option) => `${option.key} (${option.label})`).join(', ')}. Return only visible, plausible factor hypotheses. The notice must briefly tell the user to review the suggestions before saving.`,
                 type: 'input_text',
               },
             ],
@@ -103,8 +107,8 @@ export async function POST(request: Request) {
         store: false,
         text: {
           format: {
-            name: 'meal_factor_suggestions',
-            schema: FACTOR_SCHEMA,
+            name: 'meal_photo_suggestions',
+            schema: ANALYSIS_SCHEMA,
             strict: true,
             type: 'json_schema',
           },
@@ -167,7 +171,9 @@ export async function POST(request: Request) {
     }
 
     const result: MealAnalysisResult = {
+      contractVersion: 2,
       factors: analysis.factors,
+      mealName: analysis.mealName,
       model: OPENAI_MODEL,
       notice: analysis.notice,
       source: 'openai',
@@ -189,9 +195,11 @@ export async function POST(request: Request) {
 
 function fixtureResult(): MealAnalysisResult {
   return {
+    contractVersion: 2,
     factors: [...FIXTURE_FACTOR_KEYS],
+    mealName: null,
     model: 'deterministic-fixture',
-    notice: 'Demo fixture only. A photo cannot reveal hidden ingredients.',
+    notice: 'Demo fixture only. Review the suggestions before saving.',
     source: 'fixture',
   };
 }
@@ -242,6 +250,9 @@ function parseOpenAIAnalysis(value: string): OpenAIAnalysisPayload | null {
     if (
       !isRecord(parsed) ||
       !Array.isArray(parsed.factors) ||
+      typeof parsed.mealName !== 'string' ||
+      parsed.mealName.trim().length === 0 ||
+      parsed.mealName.trim().length > 80 ||
       typeof parsed.notice !== 'string' ||
       parsed.notice.length === 0 ||
       parsed.notice.length > 240
@@ -254,7 +265,11 @@ function parseOpenAIAnalysis(value: string): OpenAIAnalysisPayload | null {
       return null;
     }
 
-    return { factors: [...new Set(factors)], notice: parsed.notice };
+    return {
+      factors: [...new Set(factors)],
+      mealName: parsed.mealName.trim(),
+      notice: parsed.notice,
+    };
   } catch {
     return null;
   }

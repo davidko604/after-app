@@ -5,8 +5,13 @@ import { StyleSheet, Text, View } from 'react-native';
 
 import { ActionButton, Body, Card, Eyebrow, Heading, Screen, SectionTitle, StatusPill } from '@/components/app-ui';
 import { palette, spacing } from '@/constants/theme';
+import { booleanSettingCodec, createDiaryDataLayer } from '@/db';
 import { DATABASE_VERSION } from '@/db/migrate';
-import { usePrototypeState } from '@/features/prototype/prototype-state';
+import { SYNTHETIC_SAMPLE_HISTORY } from '@/features/patterns';
+import {
+  SAMPLE_DATA_ENABLED_SETTING,
+  sampleHistoryToDataset,
+} from '@/features/patterns/sample-dataset';
 
 type UserVersionRow = { user_version: number };
 type DatabaseState =
@@ -17,8 +22,10 @@ type DatabaseState =
 
 export default function SettingsScreen() {
   const db = useSQLiteContext();
-  const { reset, sampleDataEnabled, setSampleDataEnabled } = usePrototypeState();
   const [databaseState, setDatabaseState] = useState<DatabaseState>({ status: 'loading' });
+  const [sampleDataEnabled, setSampleDataEnabled] = useState(false);
+  const [sampleDataBusy, setSampleDataBusy] = useState(true);
+  const [sampleDataError, setSampleDataError] = useState<string | null>(null);
   const [resetComplete, setResetComplete] = useState(false);
   const [showResetConfirmation, setShowResetConfirmation] = useState(false);
 
@@ -27,10 +34,16 @@ export default function SettingsScreen() {
 
     async function loadVersion() {
       try {
-        const row = await db.getFirstAsync<UserVersionRow>('PRAGMA user_version');
+        const diary = createDiaryDataLayer(db);
+        const [row, sampleSetting] = await Promise.all([
+          db.getFirstAsync<UserVersionRow>('PRAGMA user_version'),
+          diary.settings.get(SAMPLE_DATA_ENABLED_SETTING, booleanSettingCodec),
+        ]);
         const version = row?.user_version ?? 0;
 
         if (active) {
+          setSampleDataEnabled(sampleSetting?.value ?? false);
+          setSampleDataBusy(false);
           setDatabaseState(
             version === DATABASE_VERSION
               ? { status: 'ready', version }
@@ -39,6 +52,7 @@ export default function SettingsScreen() {
         }
       } catch {
         if (active) {
+          setSampleDataBusy(false);
           setDatabaseState({ status: 'error' });
         }
       }
@@ -60,13 +74,35 @@ export default function SettingsScreen() {
           ? 'Needs attention'
           : 'Check failed';
 
-  function handleSampleDataChange(enabled: boolean) {
+  async function handleSampleDataChange(enabled: boolean) {
+    if (sampleDataBusy) {
+      return;
+    }
+
     setResetComplete(false);
-    setSampleDataEnabled(enabled);
+    setSampleDataBusy(true);
+    setSampleDataError(null);
+
+    try {
+      const diary = createDiaryDataLayer(db);
+      if (enabled) {
+        await diary.sampleData.replace(sampleHistoryToDataset(SYNTHETIC_SAMPLE_HISTORY));
+      } else {
+        await diary.sampleData.reset();
+      }
+      await diary.settings.set(SAMPLE_DATA_ENABLED_SETTING, enabled, booleanSettingCodec);
+      setSampleDataEnabled(enabled);
+    } catch {
+      setSampleDataError(
+        'After could not update synthetic history. The private diary was not changed. Try again.',
+      );
+    } finally {
+      setSampleDataBusy(false);
+    }
   }
 
-  function confirmReset() {
-    reset();
+  async function confirmReset() {
+    await handleSampleDataChange(false);
     setShowResetConfirmation(false);
     setResetComplete(true);
   }
@@ -89,7 +125,7 @@ export default function SettingsScreen() {
         <Text style={styles.cardTitle}>Local storage status</Text>
         <Body>
           A local SQLite diary is prepared on this device, with no account or cloud sync. Entries
-          created by the current demo flow remain in memory and reset when the app restarts.
+          you create are saved locally and remain available across app restarts.
         </Body>
         {databaseState.status === 'loading' ? (
           <Text
@@ -137,12 +173,26 @@ export default function SettingsScreen() {
           <Host matchContents={{ vertical: true }} style={styles.switchHost}>
             <Switch
               label="Sample history"
-              onValueChange={handleSampleDataChange}
+              disabled={sampleDataBusy}
+              onValueChange={(enabled) => void handleSampleDataChange(enabled)}
               testID="settings-sample-data"
               value={sampleDataEnabled}
             />
           </Host>
-          <Body>18 days of clearly labeled synthetic meals, symptoms, and counterexamples.</Body>
+          <Body>
+            {SYNTHETIC_SAMPLE_HISTORY.metadata.dayCount} days of clearly labeled synthetic meals,
+            symptoms, context, and counterexamples. Today and Patterns switch to sample-only mode.
+          </Body>
+          {sampleDataBusy ? (
+            <Text accessibilityLiveRegion="polite" style={styles.metadata}>
+              Updating sample history…
+            </Text>
+          ) : null}
+          {sampleDataError ? (
+            <Text accessibilityRole="alert" style={styles.errorText}>
+              {sampleDataError}
+            </Text>
+          ) : null}
         </View>
         <View style={styles.divider} />
         <View style={styles.row}>
@@ -163,7 +213,7 @@ export default function SettingsScreen() {
             <Text accessibilityRole="alert" style={styles.cardTitle}>Reset the current demo?</Text>
             <Body>
               This clears the in-memory meal and symptom and disables sample history. It does not
-              delete records from the local SQLite database.
+              delete your real meals or symptoms from the local SQLite diary.
             </Body>
             <View style={styles.confirmationActions}>
               <ActionButton
@@ -174,14 +224,14 @@ export default function SettingsScreen() {
               />
               <ActionButton
                 label="Reset demo"
-                onPress={confirmReset}
+                onPress={() => void confirmReset()}
                 testID="settings-reset-approve"
               />
             </View>
           </View>
         ) : (
           <ActionButton
-            label="Reset current demo"
+            label="Clear sample history"
             onPress={() => {
               setResetComplete(false);
               setShowResetConfirmation(true);
@@ -195,7 +245,7 @@ export default function SettingsScreen() {
             accessibilityLiveRegion="polite"
             style={styles.successText}
             testID="settings-reset-complete">
-            Current demo reset.
+            Sample history cleared. Your private diary was not changed.
           </Text>
         ) : null}
       </Card>

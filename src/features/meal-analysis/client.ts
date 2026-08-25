@@ -44,8 +44,8 @@ export async function analyzeMealPhoto(
     const result = parseMealAnalysisResult(body);
     if (!result) {
       throw new MealAnalysisClientError(
-        'Meal-photo analysis returned an unexpected response.',
-        'Review the existing factor suggestions manually. The photo remains on this device.',
+        'Meal-photo analysis is out of sync with this app version.',
+        'Continue manually. During development, reconnect the app to the current Expo session before trying again.',
       );
     }
 

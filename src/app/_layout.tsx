@@ -7,6 +7,7 @@ import { StyleSheet, Text, View } from 'react-native';
 import { palette } from '@/constants/theme';
 import { DATABASE_NAME, migrateDatabase } from '@/db/migrate';
 import { PrototypeStateProvider } from '@/features/prototype/prototype-state';
+import { withObserveRoot } from '@/services/observe';
 
 void SplashScreen.preventAutoHideAsync();
 
@@ -26,9 +27,10 @@ function AppNavigator() {
       }}>
       <Stack.Screen name="(tabs)" options={{ headerShown: false }} />
       <Stack.Screen name="meal/new" options={{ title: 'Log a meal', presentation: 'modal' }} />
+      <Stack.Screen name="meal/[mealId]" options={{ title: 'Meal details' }} />
       <Stack.Screen
         name="check-in/[mealId]"
-        options={{ title: 'Symptom check-in', presentation: 'modal' }}
+        options={{ title: 'Bathroom check-in', presentation: 'modal' }}
       />
     </Stack>
   );
@@ -105,4 +107,4 @@ const styles = StyleSheet.create({
   },
 });
 
-export default RootLayout;
+export default withObserveRoot(RootLayout);

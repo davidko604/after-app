@@ -58,6 +58,7 @@ export function Card({ children, style }: PropsWithChildren<{ style?: ViewStyle 
 
 type ActionButtonProps = {
   accessibilityHint?: string;
+  accessibilityLabel?: string;
   disabled?: boolean;
   label: string;
   onPress: () => void;
@@ -67,6 +68,7 @@ type ActionButtonProps = {
 
 export function ActionButton({
   accessibilityHint,
+  accessibilityLabel,
   disabled = false,
   label,
   onPress,
@@ -76,7 +78,7 @@ export function ActionButton({
   return (
     <Pressable
       accessibilityHint={accessibilityHint}
-      accessibilityLabel={label}
+      accessibilityLabel={accessibilityLabel ?? label}
       accessibilityRole="button"
       accessibilityState={{ disabled }}
       disabled={disabled}

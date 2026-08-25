@@ -1,19 +1,28 @@
 import { Image } from 'expo-image';
 import * as ImagePicker from 'expo-image-picker';
 import { router } from 'expo-router';
-import { useState } from 'react';
+import { useSQLiteContext } from 'expo-sqlite';
+import { useRef, useState } from 'react';
 import { Alert, Pressable, StyleSheet, Text, TextInput, View } from 'react-native';
 
 import { ActionButton, Body, Card, Eyebrow, Heading, Screen, StatusPill } from '@/components/app-ui';
 import { palette, radii, spacing } from '@/constants/theme';
+import { createMealRepository } from '@/db/meals';
+import type { MealFactorInput, SuggestionSource } from '@/db/model';
 import { analyzeMealPhoto, MealAnalysisClientError } from '@/features/meal-analysis/client';
 import {
   factorLabelForKey,
+  isSupportedImageMediaType,
   MAX_IMAGE_BASE64_LENGTH,
   MEAL_FACTOR_OPTIONS,
   type MealAnalysisResult,
+  type SupportedImageMediaType,
 } from '@/features/meal-analysis/contract';
-import { INITIAL_FACTORS, usePrototypeState } from '@/features/prototype/prototype-state';
+import { deletePersistedMealPhoto, persistMealPhoto } from '@/features/meal-photos/storage';
+import { usePrototypeState } from '@/features/prototype/prototype-state';
+import {
+  scheduleMealCheckInNotification,
+} from '@/services/meal-check-in-notifications';
 
 const FACTORS = MEAL_FACTOR_OPTIONS.map((option) => option.label);
 
@@ -24,14 +33,20 @@ type AnalysisState =
   | { message: string; recovery: string; status: 'error' };
 
 export default function NewMealScreen() {
+  const db = useSQLiteContext();
   const { saveMeal } = usePrototypeState();
   const [step, setStep] = useState<1 | 2>(1);
-  const [mealName, setMealName] = useState('Creamy tomato pasta');
+  const [mealName, setMealName] = useState('');
+  const mealNameWasEdited = useRef(false);
+  const analysisRequestId = useRef(0);
   const [photoUri, setPhotoUri] = useState<string | null>(null);
   const [photoBase64, setPhotoBase64] = useState<string | null>(null);
-  const [selectedFactors, setSelectedFactors] = useState<string[]>([...INITIAL_FACTORS]);
+  const [photoMediaType, setPhotoMediaType] = useState<SupportedImageMediaType | null>(null);
+  const [selectedFactors, setSelectedFactors] = useState<string[]>([]);
   const [analysisState, setAnalysisState] = useState<AnalysisState>({ status: 'idle' });
   const [customFactor, setCustomFactor] = useState('');
+  const [isSaving, setIsSaving] = useState(false);
+  const [saveError, setSaveError] = useState<string | null>(null);
 
   async function choosePhoto(source: 'camera' | 'library') {
     try {
@@ -63,9 +78,16 @@ export default function NewMealScreen() {
 
       if (!result.canceled) {
         const asset = result.assets[0];
+        const nextPhotoBase64 = asset?.base64 ?? null;
+        const nextPhotoMediaType = resolveImageMediaType(asset?.mimeType, asset?.uri);
+        if (!mealNameWasEdited.current) {
+          setMealName('');
+        }
         setPhotoUri(asset?.uri ?? null);
-        setPhotoBase64(asset?.base64 ?? null);
-        setAnalysisState({ status: 'idle' });
+        setPhotoBase64(nextPhotoBase64);
+        setPhotoMediaType(nextPhotoMediaType);
+        setSelectedFactors([]);
+        void analyzeSelectedPhoto(nextPhotoBase64, nextPhotoMediaType);
       }
     } catch {
       Alert.alert(
@@ -75,32 +97,51 @@ export default function NewMealScreen() {
     }
   }
 
-  async function suggestFactors() {
-    if (!photoBase64) {
+  async function analyzeSelectedPhoto(
+    imageBase64: string | null,
+    mediaType: SupportedImageMediaType | null,
+  ) {
+    const requestId = ++analysisRequestId.current;
+
+    if (!imageBase64) {
       const message = 'The selected photo could not be prepared for analysis.';
-      const recovery = 'Choose the photo again or continue with the editable fixture suggestions.';
+      const recovery = 'Choose the photo again or continue by naming the meal and editing factors manually.';
       setAnalysisState({ message, recovery, status: 'error' });
-      Alert.alert(message, recovery);
       return;
     }
 
-    if (photoBase64.length > MAX_IMAGE_BASE64_LENGTH) {
+    if (!mediaType) {
+      const message = 'This photo format is not supported for analysis.';
+      const recovery = 'Choose a JPEG, PNG, or WebP image, or review factors manually.';
+      setAnalysisState({ message, recovery, status: 'error' });
+      return;
+    }
+
+    if (imageBase64.length > MAX_IMAGE_BASE64_LENGTH) {
       const message = 'The selected photo is too large to analyze.';
       const recovery = 'Crop it more tightly, choose a smaller image, or review factors manually.';
       setAnalysisState({ message, recovery, status: 'error' });
-      Alert.alert(message, recovery);
       return;
     }
 
     setAnalysisState({ status: 'loading' });
     try {
       const result = await analyzeMealPhoto({
-        imageBase64: photoBase64,
-        mediaType: 'image/jpeg',
+        imageBase64,
+        mediaType,
       });
+      if (requestId !== analysisRequestId.current) {
+        return;
+      }
       setSelectedFactors(result.factors.map(factorLabelForKey));
+      if (result.mealName && !mealNameWasEdited.current) {
+        setMealName(result.mealName);
+      }
       setAnalysisState({ result, status: 'ready' });
     } catch (error) {
+      if (requestId !== analysisRequestId.current) {
+        return;
+      }
       const analysisError =
         error instanceof MealAnalysisClientError
           ? error
@@ -113,8 +154,15 @@ export default function NewMealScreen() {
         recovery: analysisError.recovery,
         status: 'error',
       });
-      Alert.alert(analysisError.message, analysisError.recovery);
     }
+  }
+
+  function continueToFactors() {
+    if (analysisState.status === 'loading') {
+      analysisRequestId.current += 1;
+      setAnalysisState({ status: 'idle' });
+    }
+    setStep(2);
   }
 
   function toggleFactor(factor: string) {
@@ -137,13 +185,60 @@ export default function NewMealScreen() {
     setCustomFactor('');
   }
 
-  function finishMeal() {
-    saveMeal({
-      factors: selectedFactors,
-      name: mealName.trim() || 'Untitled meal',
-      photoUri,
-    });
-    router.replace('/');
+  async function finishMeal() {
+    const name = mealName.trim();
+    if (!name) {
+      setStep(1);
+      Alert.alert(
+        'Name this meal before saving',
+        'Type a short name yourself, or review a photo with Luna for an editable suggestion.',
+      );
+      return;
+    }
+
+    if (isSaving) {
+      return;
+    }
+
+    setIsSaving(true);
+    setSaveError(null);
+    let persistedPhotoUri: string | null = null;
+
+    try {
+      persistedPhotoUri = photoUri
+        ? await persistMealPhoto(photoUri, photoMediaType)
+        : null;
+      const repository = createMealRepository(db, 'real');
+      const factors = selectedFactors.map((label) =>
+        mealFactorInput(label, analysisState),
+      );
+      let meal = await repository.create({
+        checkInDelayMinutes: 180,
+        factors,
+        imageUri: persistedPhotoUri,
+        name,
+        occurredAt: new Date().toISOString(),
+      });
+
+      const notification = await scheduleMealCheckInNotification({
+        delayMinutes: meal.checkInDelayMinutes,
+        mealId: meal.id,
+        mealName: meal.name,
+      }).catch(() => ({ status: 'unavailable' as const }));
+
+      if (notification.status === 'scheduled') {
+        meal = await repository.update(meal.id, { notificationId: notification.identifier });
+      }
+
+      saveMeal({ factors: selectedFactors, name: meal.name, photoUri: meal.imageUri });
+      router.replace('/');
+    } catch {
+      deletePersistedMealPhoto(persistedPhotoUri);
+      setSaveError(
+        'After could not save this meal to the local diary. Check that this device has storage available, then try again.',
+      );
+      setIsSaving(false);
+    }
   }
 
   if (step === 2) {
@@ -161,8 +256,8 @@ export default function NewMealScreen() {
         </Body>
 
         <Card style={styles.cautionCard}>
-          <Text style={styles.cautionTitle}>A photo cannot reveal hidden ingredients</Text>
-          <Body>After will never describe a meal tag as certain or claim that it caused a symptom.</Body>
+          <Text style={styles.cautionTitle}>Review every suggestion</Text>
+          <Body>Photo suggestions can miss ingredients. Confirm or edit the tags before saving.</Body>
         </Card>
 
         <View style={styles.factors}>
@@ -228,7 +323,17 @@ export default function NewMealScreen() {
           </Body>
         </Card>
 
-        <ActionButton label="Save meal" onPress={finishMeal} testID="meal-save" />
+        {saveError ? (
+          <Text accessibilityRole="alert" style={styles.saveError} testID="meal-save-error">
+            {saveError}
+          </Text>
+        ) : null}
+        <ActionButton
+          disabled={isSaving}
+          label={isSaving ? 'Saving meal…' : 'Save meal'}
+          onPress={() => void finishMeal()}
+          testID="meal-save"
+        />
         <ActionButton
           label="Back to meal"
           onPress={() => setStep(1)}
@@ -274,14 +379,21 @@ export default function NewMealScreen() {
             <Text style={styles.photoActionText}>Library</Text>
           </Pressable>
         </View>
+        <Body style={styles.centeredText}>
+          Choosing a photo automatically sends only that image to Luna for editable suggestions.
+          Diary entries and symptom records are not included.
+        </Body>
       </Card>
 
       <View style={styles.field}>
         <Text style={styles.label}>Meal name</Text>
         <TextInput
           accessibilityLabel="Meal name"
-          onChangeText={setMealName}
-          placeholder="For example, pasta at home"
+          onChangeText={(value) => {
+            mealNameWasEdited.current = true;
+            setMealName(value);
+          }}
+          placeholder="Name this meal"
           placeholderTextColor={palette.muted}
           returnKeyType="done"
           style={styles.input}
@@ -303,8 +415,8 @@ export default function NewMealScreen() {
                 : analysisState.status === 'error'
                   ? analysisState.message
                   : photoUri
-                    ? 'Photo ready for optional analysis'
-                    : 'Editable demo suggestions'}
+                    ? 'Preparing photo analysis'
+                    : 'Optional photo analysis'}
           </Text>
           <StatusPill tone={analysisState.status === 'error' ? 'peach' : 'sage'}>
             {analysisState.status === 'loading'
@@ -313,38 +425,72 @@ export default function NewMealScreen() {
                 ? 'Luna'
                 : analysisState.status === 'error'
                   ? 'Manual available'
-                  : 'Deterministic'}
+                  : 'Optional'}
           </StatusPill>
         </View>
         <Body style={styles.cardBody}>
           {analysisState.status === 'loading'
-            ? 'Only the selected image is being sent. Meal names and diary records are not included.'
+            ? 'Only the selected image is being sent. Existing diary records are not included.'
             : analysisState.status === 'ready'
               ? analysisState.result.notice
               : analysisState.status === 'error'
                 ? analysisState.recovery
                 : photoUri
-                  ? 'Only the selected image will be sent. Luna cannot identify hidden ingredients. You must confirm every suggestion.'
-                  : 'Dairy, high-fat food, and large meal are preselected without using a network or AI provider.'}
+                  ? 'Only the selected image is sent. Review the suggestions before saving.'
+                  : 'Add a photo for automatic suggestions, or name the meal and review factors manually.'}
         </Body>
+        {analysisState.status === 'ready' ? (
+          <View style={styles.analysisSuggestions} testID="meal-analysis-suggestions">
+            {analysisState.result.mealName ? (
+              <>
+                <Text style={styles.analysisSuggestionsLabel}>Suggested meal name</Text>
+                <Text style={styles.analysisSuggestionsText}>{analysisState.result.mealName}</Text>
+              </>
+            ) : null}
+            <Text style={styles.analysisSuggestionsLabel}>
+              {analysisState.result.factors.length > 0
+                ? 'Suggested factors'
+                : 'No supported factors visibly identified'}
+            </Text>
+            {analysisState.result.factors.length > 0 ? (
+              <Text style={styles.analysisSuggestionsText}>
+                {analysisState.result.factors.map(factorLabelForKey).join(' · ')}
+              </Text>
+            ) : (
+              <Body>
+                Luna did not find a visible match from the supported list. You can still add factors
+                manually when you know more than the photo shows.
+              </Body>
+            )}
+          </View>
+        ) : null}
       </Card>
 
-      {photoUri ? (
+      {photoUri && analysisState.status === 'error' && photoBase64 && photoMediaType ? (
         <ActionButton
-          accessibilityHint="Sends only the selected image to the server-side Luna analysis route"
-          disabled={analysisState.status === 'loading'}
-          label={analysisState.status === 'loading' ? 'Reviewing photo…' : 'Suggest factors with Luna'}
-          onPress={() => void suggestFactors()}
+          accessibilityHint="Retries one server-side Luna request for the currently selected image"
+          label="Try photo analysis again"
+          onPress={() => void analyzeSelectedPhoto(photoBase64, photoMediaType)}
           testID="meal-analyze-photo"
           variant="secondary"
         />
       ) : null}
 
       <ActionButton
-        disabled={analysisState.status === 'loading'}
-        label="Review and confirm factors"
-        onPress={() => setStep(2)}
+        label={
+          analysisState.status === 'loading'
+            ? 'Skip AI and review factors now'
+            : analysisState.status === 'ready'
+            ? analysisState.result.factors.length > 0
+              ? `Review ${analysisState.result.factors.length} suggested ${analysisState.result.factors.length === 1 ? 'factor' : 'factors'}`
+              : 'Review and add factors manually'
+            : photoUri
+              ? 'Skip AI and review factors manually'
+              : 'Review and confirm factors'
+        }
+        onPress={continueToFactors}
         testID="meal-review-factors"
+        variant={photoUri && analysisState.status !== 'ready' ? 'secondary' : undefined}
       />
       <ActionButton
         label="Cancel"
@@ -357,6 +503,15 @@ export default function NewMealScreen() {
 }
 
 const styles = StyleSheet.create({
+  analysisSuggestions: {
+    borderTopColor: palette.forest,
+    borderTopWidth: 1,
+    gap: spacing.xs,
+    marginTop: spacing.md,
+    paddingTop: spacing.md,
+  },
+  analysisSuggestionsLabel: { color: palette.forestPressed, fontSize: 13, fontWeight: '800' },
+  analysisSuggestionsText: { color: palette.ink, fontSize: 16, fontWeight: '800' },
   cardBody: { marginTop: spacing.sm },
   cardTitle: { color: palette.ink, fontSize: 17, fontWeight: '800' },
   cautionCard: { backgroundColor: palette.peachSoft, borderColor: palette.peach },
@@ -418,5 +573,72 @@ const styles = StyleSheet.create({
   photoGlyph: { color: palette.forest, fontSize: 36, marginBottom: spacing.sm },
   photoPlaceholder: { alignItems: 'center', paddingVertical: spacing.md },
   scheduleCard: { backgroundColor: palette.sage },
+  saveError: { color: palette.danger, fontSize: 14, fontWeight: '700', lineHeight: 20 },
   topRow: { alignItems: 'center', flexDirection: 'row', gap: spacing.md, justifyContent: 'space-between' },
 });
+
+function resolveImageMediaType(
+  mimeType: string | null | undefined,
+  uri: string | null | undefined,
+): SupportedImageMediaType | null {
+  const normalizedMimeType = mimeType?.toLocaleLowerCase();
+  if (isSupportedImageMediaType(normalizedMimeType)) {
+    return normalizedMimeType;
+  }
+
+  const path = uri?.split(/[?#]/, 1)[0]?.toLocaleLowerCase();
+  if (path?.endsWith('.png')) {
+    return 'image/png';
+  }
+  if (path?.endsWith('.webp')) {
+    return 'image/webp';
+  }
+  if (path?.endsWith('.jpg') || path?.endsWith('.jpeg')) {
+    return 'image/jpeg';
+  }
+
+  return null;
+}
+
+function mealFactorInput(factorLabel: string, analysisState: AnalysisState): MealFactorInput {
+  const standardFactor = MEAL_FACTOR_OPTIONS.find(({ label }) => label === factorLabel);
+  const suggestionSource: SuggestionSource =
+    analysisState.status === 'ready'
+      ? analysisState.result.source === 'openai'
+        ? 'photo_analysis'
+        : 'fixture'
+      : 'manual';
+
+  if (standardFactor) {
+    return {
+      factor: {
+        isCustom: false,
+        key: standardFactor.key,
+        kind: 'upsert',
+        label: standardFactor.label,
+      },
+      suggestionSource,
+    };
+  }
+
+  return {
+    factor: {
+      isCustom: true,
+      key: customFactorKey(factorLabel),
+      kind: 'upsert',
+      label: factorLabel,
+    },
+    suggestionSource: 'manual',
+  };
+}
+
+function customFactorKey(label: string): string {
+  const normalized = label
+    .normalize('NFKD')
+    .replace(/[\u0300-\u036f]/g, '')
+    .toLocaleLowerCase()
+    .replace(/[^a-z0-9]+/g, '-')
+    .replace(/^-+|-+$/g, '');
+
+  return `custom-${normalized || 'factor'}`;
+}

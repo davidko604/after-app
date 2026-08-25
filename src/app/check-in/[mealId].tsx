@@ -1,10 +1,12 @@
 import { router, useLocalSearchParams } from 'expo-router';
-import { useRef, useState } from 'react';
+import { useSQLiteContext } from 'expo-sqlite';
+import { useEffect, useRef, useState } from 'react';
 import { Pressable, StyleSheet, Text, TextInput, View } from 'react-native';
 
 import { ActionButton, Body, Card, Eyebrow, Heading, Screen, StatusPill } from '@/components/app-ui';
 import { palette, radii, spacing } from '@/constants/theme';
-import { usePrototypeState } from '@/features/prototype/prototype-state';
+import { createDiaryDataLayer, type Meal } from '@/db';
+import { cancelMealCheckInNotification } from '@/services/meal-check-in-notifications';
 
 type Urgency = 'none' | 'moderate' | 'strong';
 
@@ -35,7 +37,7 @@ function NumberScale({
   values,
 }: {
   accessibilityName: string;
-  labels?: { end: string; start: string };
+  labels?: { end: string; middle?: string; start: string };
   onChange: (value: number) => void;
   optionLabels?: Record<number, string>;
   testID: string;
@@ -70,6 +72,7 @@ function NumberScale({
       {labels ? (
         <View style={styles.scaleLabels}>
           <Text style={styles.scaleLabel}>{labels.start}</Text>
+          {labels.middle ? <Text style={styles.scaleLabel}>{labels.middle}</Text> : null}
           <Text style={styles.scaleLabel}>{labels.end}</Text>
         </View>
       ) : null}
@@ -86,9 +89,11 @@ function NumberScale({
 }
 
 export default function CheckInScreen() {
+  const db = useSQLiteContext();
   const { mealId } = useLocalSearchParams<{ mealId: string }>();
-  const { meal, saveSymptom } = usePrototypeState();
-  const linkedMeal = mealId === 'prototype-meal' ? meal : null;
+  const numericMealId = Number(mealId);
+  const [linkedMeal, setLinkedMeal] = useState<Meal | null>(null);
+  const [mealLookupComplete, setMealLookupComplete] = useState(mealId === 'unlinked');
   const isUnlinked = !linkedMeal;
   const savingLock = useRef(false);
   const [stoolConsistency, setStoolConsistency] = useState<number | null>(null);
@@ -99,11 +104,68 @@ export default function CheckInScreen() {
   const [isSaving, setIsSaving] = useState(false);
   const [saveError, setSaveError] = useState(false);
   const [showValidationError, setShowValidationError] = useState(false);
+  const [showDetails, setShowDetails] = useState(false);
+  const [usedTypicalPreset, setUsedTypicalPreset] = useState(false);
+
+  useEffect(() => {
+    let active = true;
+
+    if (mealId === 'unlinked' || !Number.isInteger(numericMealId) || numericMealId <= 0) {
+      queueMicrotask(() => {
+        if (active) {
+          setMealLookupComplete(true);
+          setLinkedMeal(null);
+        }
+      });
+      return () => {
+        active = false;
+      };
+    }
+
+    void createDiaryDataLayer(db).real.meals.findById(numericMealId).then(
+      (meal) => {
+        if (active) {
+          setLinkedMeal(meal);
+          setMealLookupComplete(true);
+        }
+      },
+      () => {
+        if (active) {
+          setLinkedMeal(null);
+          setMealLookupComplete(true);
+        }
+      },
+    );
+
+    return () => {
+      active = false;
+    };
+  }, [db, mealId, numericMealId]);
 
   const isComplete =
     stoolConsistency !== null && urgency !== null && cramping !== null && bloating !== null;
 
-  function finishCheckIn() {
+  function applyTypicalPreset() {
+    setBloating(0);
+    setCramping(0);
+    setUsedTypicalPreset(true);
+    setShowValidationError(false);
+    setStoolConsistency(4);
+    setUrgency('none');
+  }
+
+  function openSymptomDetails() {
+    if (usedTypicalPreset) {
+      setBloating(null);
+      setCramping(null);
+      setStoolConsistency(null);
+      setUrgency(null);
+    }
+    setUsedTypicalPreset(false);
+    setShowDetails(true);
+  }
+
+  async function finishCheckIn() {
     if (!isComplete) {
       setShowValidationError(true);
       return;
@@ -118,7 +180,18 @@ export default function CheckInScreen() {
     setSaveError(false);
 
     try {
-      saveSymptom({ bloating, cramping, stoolConsistency, urgency });
+      await createDiaryDataLayer(db).real.symptoms.create({
+        bloating,
+        cramping,
+        mealId: linkedMeal?.id ?? null,
+        note,
+        occurredAt: new Date().toISOString(),
+        stoolConsistency,
+        urgency,
+      });
+      await cancelMealCheckInNotification(linkedMeal?.notificationId ?? null).catch(
+        () => undefined,
+      );
       router.replace('/');
     } catch {
       savingLock.current = false;
@@ -140,30 +213,103 @@ export default function CheckInScreen() {
     <Screen>
       <View style={styles.topRow} testID="check-in-screen">
         <Eyebrow>{isUnlinked ? 'Quick entry' : 'Meal check-in'}</Eyebrow>
-        <StatusPill tone="peach">Current-session demo</StatusPill>
+        <StatusPill tone="sage">Private on device</StatusPill>
       </View>
       <Heading>How are you feeling?</Heading>
-      <Body>Choose each observation before saving. No symptom values are selected for you.</Body>
+      <Body>Choose a quick preset and save, or adjust any detail before recording it.</Body>
 
       <Card style={styles.mealCard}>
         <View accessibilityElementsHidden style={styles.mealThumbnail} />
         <View style={styles.mealCopy}>
-          <Text style={styles.cardTitle}>{isUnlinked ? 'Standalone symptom entry' : linkedMeal.name}</Text>
+          <Text style={styles.cardTitle}>
+            {!mealLookupComplete
+              ? 'Opening saved meal…'
+              : isUnlinked
+                ? 'Standalone bathroom check-in'
+                : linkedMeal.name}
+          </Text>
           <Body style={styles.compactBody}>
-            {isUnlinked
+            {!mealLookupComplete
+              ? 'Reading the private diary on this device.'
+              : isUnlinked
               ? mealId === 'unlinked'
                 ? 'This check-in will not be linked to a meal.'
-                : 'The requested meal is unavailable in this preview, so this check-in will remain unlinked.'
-              : `Check-in after ${linkedMeal.name}. Meal tags: ${linkedMeal.factors.join(', ') || 'none'}.`}
+                : 'The requested meal is unavailable, so this check-in will remain unlinked.'
+              : `Check-in after ${linkedMeal.name}. Meal tags: ${linkedMeal.factors.map(({ factor }) => factor.label).join(', ') || 'none'}.`}
           </Body>
         </View>
       </Card>
 
+      <Card style={styles.quickCard}>
+        <Text style={styles.cardTitle}>Quick check-in</Text>
+        <Body style={styles.compactBody}>
+          Use the fast preset only when it matches. Otherwise record each observation separately.
+        </Body>
+        <Text style={styles.stoolGuide}>
+          Stool type is not a score: 1–2 hard · 3–4 formed · 5–7 soft to watery
+        </Text>
+        <View style={styles.quickGrid}>
+          <Pressable
+            accessibilityHint="Sets stool type 4, no urgency, no cramping, and no bloating"
+            accessibilityRole="radio"
+            accessibilityState={{ selected: usedTypicalPreset }}
+            onPress={applyTypicalPreset}
+            style={({ pressed }) => [
+              styles.quickPreset,
+              usedTypicalPreset && styles.quickPresetSelected,
+              pressed && styles.pressed,
+            ]}
+            testID="check-in-preset-typical">
+            <Text style={[styles.quickPresetText, usedTypicalPreset && styles.scaleTextSelected]}>
+              {usedTypicalPreset ? '✓ ' : ''}Everything felt typical
+            </Text>
+            <Text style={[styles.quickPresetMeta, usedTypicalPreset && styles.scaleTextSelected]}>
+              Type 4 · no urgency or discomfort
+            </Text>
+          </Pressable>
+          <Pressable
+            accessibilityHint="Opens separate stool, urgency, cramping, and bloating controls"
+            accessibilityRole="button"
+            onPress={openSymptomDetails}
+            style={({ pressed }) => [styles.quickPreset, pressed && styles.pressed]}
+            testID="check-in-record-symptoms">
+            <Text style={styles.quickPresetText}>Record symptoms</Text>
+            <Text style={styles.quickPresetMeta}>Choose each observation separately</Text>
+          </Pressable>
+        </View>
+        <Text accessibilityLiveRegion="polite" style={styles.presetSummary} testID="check-in-preset-summary">
+          {isComplete
+            ? `Stool ${stoolConsistency} (${STOOL_LABELS[stoolConsistency]}) · ${urgency} urgency · cramping ${cramping} · bloating ${bloating}`
+            : 'Choose the typical preset or record symptoms.'}
+        </Text>
+      </Card>
+
+      {saveError ? (
+        <Text accessibilityRole="alert" selectable style={styles.errorText} testID="check-in-save-error">
+          The check-in could not be saved to the local diary. Check device storage and try again.
+        </Text>
+      ) : null}
+      <ActionButton
+        disabled={!isComplete || isSaving || !mealLookupComplete}
+        label={isSaving ? 'Saving check-in…' : 'Save check-in'}
+        onPress={() => void finishCheckIn()}
+        testID="check-in-save"
+      />
+      <ActionButton
+        label={showDetails ? 'Hide details' : 'Adjust details'}
+        onPress={() => setShowDetails((visible) => !visible)}
+        testID="check-in-toggle-details"
+        variant="secondary"
+      />
+
+      {showDetails ? (
+        <>
       <View style={styles.fieldGroup}>
-        <Text accessibilityRole="header" style={styles.label}>Stool consistency · required</Text>
+        <Text accessibilityRole="header" style={styles.label}>Stool type · required</Text>
+        <Body style={styles.compactBody}>This describes consistency, not better versus worse.</Body>
         <NumberScale
           accessibilityName="Stool consistency"
-          labels={{ end: 'Watery', start: 'Hard' }}
+          labels={{ end: '7 · watery', middle: '3–4 · formed', start: '1 · hard' }}
           onChange={(value) => {
             setShowValidationError(false);
             setStoolConsistency(value);
@@ -240,7 +386,7 @@ export default function CheckInScreen() {
       </View>
 
       <View style={styles.fieldGroup}>
-        <Text style={styles.label}>Private note · not saved in this preview</Text>
+        <Text style={styles.label}>Private note · optional</Text>
         <TextInput
           accessibilityLabel="Private symptom note"
           multiline
@@ -252,6 +398,8 @@ export default function CheckInScreen() {
           value={note}
         />
       </View>
+        </>
+      ) : null}
 
       {showValidationError ? (
         <Text
@@ -262,22 +410,11 @@ export default function CheckInScreen() {
           Choose stool consistency, urgency, cramping, and bloating before saving.
         </Text>
       ) : null}
-      {saveError ? (
-        <Text accessibilityRole="alert" selectable style={styles.errorText} testID="check-in-save-error">
-          The check-in could not be added to this session. Review your choices and try again.
-        </Text>
-      ) : null}
       {isSaving ? (
         <Text accessibilityLiveRegion="polite" style={styles.savingText} testID="check-in-saving">
-          Adding check-in to this session…
+          Saving check-in to this device…
         </Text>
       ) : null}
-      <ActionButton
-        disabled={isSaving}
-        label={isSaving ? 'Saving check-in…' : 'Save check-in'}
-        onPress={finishCheckIn}
-        testID="check-in-save"
-      />
       <ActionButton
         label="Do this later"
         onPress={leaveCheckIn}
@@ -286,11 +423,10 @@ export default function CheckInScreen() {
       />
 
       <Card style={styles.privateCard}>
-        <Text style={styles.privateTitle}>Current preview behavior</Text>
+        <Text style={styles.privateTitle}>Private local observation</Text>
         <Body>
-          Symptom selections stay in memory for this app session. The note field is not saved. The
-          separate photo-analysis request receives only a meal photo you explicitly submit, not
-          these symptom selections or this note.
+          This check-in and optional note are saved only in SQLite on this device. They are never
+          included in the separate meal-photo analysis request.
         </Body>
       </Card>
     </Screen>
@@ -329,6 +465,7 @@ const styles = StyleSheet.create({
     textAlignVertical: 'top',
   },
   pressed: { opacity: 0.72 },
+  presetSummary: { color: palette.forestPressed, fontSize: 13, fontWeight: '800', lineHeight: 19 },
   privateCard: { backgroundColor: palette.sage },
   privateTitle: { color: palette.ink, fontSize: 17, fontWeight: '800', marginBottom: spacing.sm },
   scale: { flexDirection: 'row', flexWrap: 'wrap', gap: 6 },
@@ -349,8 +486,31 @@ const styles = StyleSheet.create({
   scaleLabels: { flexDirection: 'row', justifyContent: 'space-between', paddingTop: 5 },
   scaleText: { color: palette.ink, fontSize: 14, fontWeight: '800' },
   scaleTextSelected: { color: palette.white },
+  quickCard: { backgroundColor: palette.sage, gap: spacing.md },
+  quickGrid: { flexDirection: 'row', flexWrap: 'wrap', gap: spacing.sm },
+  quickPreset: {
+    alignItems: 'center',
+    backgroundColor: palette.card,
+    borderColor: palette.forest,
+    borderRadius: radii.md,
+    borderWidth: 1.5,
+    flexBasis: '47%',
+    flexGrow: 1,
+    justifyContent: 'center',
+    minHeight: 52,
+    paddingHorizontal: spacing.sm,
+  },
+  quickPresetSelected: { backgroundColor: palette.forest, borderColor: palette.forest },
+  quickPresetMeta: { color: palette.muted, fontSize: 11, fontWeight: '700', marginTop: 3 },
+  quickPresetText: { color: palette.forest, fontSize: 15, fontWeight: '800' },
   savingText: { color: palette.forest, fontSize: 14, fontWeight: '800', textAlign: 'center' },
   selectedValue: { color: palette.muted, fontSize: 12, fontWeight: '700', marginTop: spacing.xs },
+  stoolGuide: {
+    color: palette.forestPressed,
+    fontSize: 12,
+    fontWeight: '800',
+    lineHeight: 17,
+  },
   segmentButton: {
     alignItems: 'center',
     backgroundColor: palette.card,
